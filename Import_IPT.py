@@ -49,7 +49,7 @@ def ReadIgnorable(fname):
 def skip():
 	return
 
-def ReadElement(ole, fname, counter):
+def ReadElement(ole, fname, counter, geometryOnly=False, featureOnly=False):
 	name        = fname[-1]
 	path        = PrintableName(fname)
 
@@ -73,6 +73,10 @@ def ReadElement(ole, fname, counter):
 					fnameB.append(n)
 				fnameB[-1] = 'B' + name[1:]
 				seg = ReadRSeMetaDataM(ole.openstream(fname).read(), name[1:])
+				if geometryOnly and not ('brep' in seg.name.lower() or 'graphics' in seg.name.lower() or seg.name == 'AmDcSegment'):
+					return
+				if featureOnly and not any(key in seg.name.lower() for key in ('brep', 'dcsegment', 'graphics', 'browser')):
+					return
 				seg.file = name[1:]
 				seg.index = counter
 				getModel().RSeMetaData[seg.name] = seg
@@ -175,7 +179,7 @@ def checkVersion(file):
 		logError('Can\'t determine Inventor version file was created with!')
 	return None
 
-def read(ole):
+def read(ole, strategy=None, geometryOnly=False, featureOnly=False):
 	ufrxDoc        = None
 	rSeDb          = None
 	rSeSegInfo     = None
@@ -242,7 +246,14 @@ def read(ole):
 		ReadRSeDbRevisionInfo(getModel().RSeRevisions, rSeDbRevisions)
 #		dumpRevisionInfo(getModel().RSeRevisions)
 
-	chooseImportStrategy()
+	if strategy is None:
+		strategy = chooseImportStrategy()
+	if strategy == STRATEGY_CANCEL:
+		return False
+	# Supplying a strategy must not change the user's saved preference.
+	import importerUtils
+	importerUtils.__strategy__ = strategy
+	geometryOnly = geometryOnly or strategy != STRATEGY_NATIVE
 
 	for fname in elements:
 		if (handled.get(PrintableName(fname), False) == False):
@@ -252,7 +263,7 @@ def read(ole):
 	dumpiProperties(getModel().iProperties)
 
 	for fname in list:
-		ReadElement(ole, fname, counter)
+		ReadElement(ole, fname, counter, geometryOnly, featureOnly)
 		counter += 1
 	ole.close()
 

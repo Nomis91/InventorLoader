@@ -1,6 +1,7 @@
 # InventorLoader
 Loads/Imports: Autodesk (R) Inventor (R) files into FreeCAD (v0.18 or greater). 
-Until now only Parts (IPT) but not assemblies (IAM) or drawings (IDW) or presentations (IPN) can be displayed.
+This proposed extension imports IPT parts with validated editable features or checked saved solids, and IAM assemblies with editable component definitions and saved placements. The native extension is tested with FreeCAD 1.1.4. See `CHECKED_IMPORT.md` for behavior and limitations. IDW and IPN are not supported.
+Native material removals use linked `Part::Cut` features. Every native component must pass an automatic comparison against the STEP-imported saved geometry; results are stored in `InventorStepComparison`.
 
 As Inventor files contains a complete ACIS model representation, SAT and SAB files can also be 
 imported into FreeCAD.
@@ -22,6 +23,7 @@ This Addon also requires additional python packages:
 * https://pypi.python.org/pypi/xlwt - for writing embedded Excel workbooks
 * http://www.decalage.info/python/olefileio - olefile for reading Microsoft OLE(2)
     files.
+* https://pypi.org/project/zstandard/ - for newer Inventor compressed streams.
 
 ## Installation
 ### Automatic Install (recommended)
