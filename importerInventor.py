@@ -66,40 +66,26 @@ def makeBodies(doc, parent, shapes, source, mode):
 
 def nativeBodies(doc, parent, model, reference, source):
     from importerNative import Importer
+    from importerStructure import organize
     before={o.Name for o in doc.Objects}
-    history=None
-    if parent:
-        history=doc.addObject('App::DocumentObjectGroup','InventorFeatureHistory')
-        history.Label='Skizzen und Konstruktionsverlauf'
-        parent.addObject(history)
     importer=Importer(source=source)
-    candidates=importer.build(history)
+    candidates=importer.build(parent)
     doc.recompute(None,True,True)
     if not candidates:
         raise ValueError('Native reconstruction produced no final solid')
+    # Presenting the source hierarchy touches dependencies. Validate the final
+    # recomputed document, including those changes, before recording a match.
+    organize(model,importer,candidates,before,parent)
+    doc.recompute(None,True,True)
     shape=Part.makeCompound([o.Shape for o in candidates])
     for solid in shape.Solids:
         solid.check(True)
     comparison=compareShapes(shape,Part.makeCompound(reference))
     if not comparison['matches']:
         raise ValueError('Native reconstruction differs from the saved Inventor BRep (STEP import): '+str(source)+'; '+json.dumps(comparison))
-    if parent:
-        for obj in doc.Objects:
-            if obj.Name not in before and not any(p.TypeId in ('App::Part','App::DocumentObjectGroup') for p in obj.InList):
-                history.addObject(obj)
-        for obj in candidates:
-            if obj in history.Group:history.removeObject(obj)
-            parent.addObject(obj)
-        history.Visibility=False
     for obj in candidates:
-        obj.Visibility=True
         annotate(obj,source,'Native features; checked against saved BRep')
         obj.addProperty('App::PropertyString','InventorStepComparison','Inventor import').InventorStepComparison=json.dumps(comparison,sort_keys=True)
-    # A removal tool is a positive solid used by a Cut. Display only final
-    # bodies so those tools and old additive stages cannot fill the holes.
-    for obj in doc.Objects:
-        if obj.Name not in before and obj not in candidates and hasattr(obj,'Shape'):
-            obj.Visibility=False
     return candidates
 
 
@@ -115,6 +101,7 @@ def part(source, doc, parent=None, strategy=None):
 
 def assembly(source, doc, parent=None, ancestors=(), strategy=None):
     import importerAssembly as A
+    import importerStructure as S
     key=os.path.normcase(os.path.realpath(str(source)))
     if key in ancestors:
         raise ValueError('Cyclic Inventor assembly reference: ' + str(source))
@@ -122,35 +109,35 @@ def assembly(source, doc, parent=None, ancestors=(), strategy=None):
         refs=A.references(ole.openstream('UFRxDoc').read())
     with parsed(source,strategy=U.STRATEGY_STEP,geometryOnly=True) as model:
         entries=A.occurrences(model,refs)
+        specification=S.assemblySpecification(model)
     resolver=A.Resolver(Path(source).parent)
     # Resolve all files before creating any objects, so missing parts are explicit.
     for entry in entries:
         entry['path'],entry['identity']=resolver.resolve(entry['reference'])
-    group=doc.addObject('App::Part','InventorAssembly')
-    group.Label=Path(source).stem
+    group=S.component(doc,'InventorAssembly',Path(source).stem,nested=parent is not None)
     annotate(group,source,'IAM saved occurrences and placements (constraints not reconstructed)')
     if parent:
         parent.addObject(group)
-    definitions=doc.addObject('App::DocumentObjectGroup','InventorDefinitions')
-    definitions.Label='Component definitions'
-    group.addObject(definitions)
-    definitions.Visibility=False
+    sourceFolders=S.assemblyFolders(doc,group,specification)
+    links=[]
     cache={}
     for entry in entries:
         path=entry['path']
         cachekey=os.path.normcase(str(path.resolve()))
         if cachekey not in cache:
             if path.suffix.lower()=='.iam':
-                definition=assembly(path,doc,definitions,ancestors+(key,),strategy=strategy)
+                definition=assembly(path,doc,group,ancestors+(key,),strategy=strategy)
             else:
-                definition=doc.addObject('App::Part','InventorComponent')
-                definition.Label=path.stem
-                definitions.addObject(definition)
-                part(path,doc,definition,strategy=strategy)
+                definition=S.component(doc,'InventorComponent',path.stem)
+                group.addObject(definition)
+                bodies=part(path,doc,definition,strategy=strategy)
+                if not definition.InventorResults:
+                    definition.InventorResults=bodies;definition.Proxy.execute(definition)
             definition.Visibility=False
             cache[cachekey]=definition
         link=doc.addObject('App::Link','InventorOccurrence')
         link.setLink(cache[cachekey])
+        link.LinkClaimChild=False
         group.addObject(link)
         link.Label=entry['label']
         link.Placement=entry['placement']
@@ -162,6 +149,16 @@ def assembly(source, doc, parent=None, ancestors=(), strategy=None):
         if changed:
             U.logWarning('IAM: %s uses a newer/different component revision: %s\n',entry['label'],str(path))
         link.Visibility=True
+        links.append(link)
+    group.InventorResults=links
+    group.InventorChildren=sourceFolders+links if parent else []
+    group.Proxy.execute(group)
+    if parent is None:
+        # The FreeCAD document already represents the root assembly. Do not
+        # make its occurrences children of a second, hidden assembly wrapper.
+        group.Group=[]
+        for link in links:link.Visibility=True
+    group.addProperty('App::PropertyString','InventorStructure','Inventor import').InventorStructure=json.dumps(dict(source_order=[o.Label for o in sourceFolders]+[o.Label for o in links],extra_import_groups=False))
     doc.recompute()
     return group
 
@@ -172,6 +169,11 @@ def importFile(source, doc=None, root=None, strategy=None):
     doc=doc or App.newDocument(source.stem)
     App.setActiveDocument(doc.Name)
     doc.openTransaction('Import Inventor file')
+    labels=App.ParamGet('User parameter:BaseApp/Preferences/Document')
+    duplicateLabels=labels.GetBool('DuplicateLabels',False)
+    # Origin/Sketch1/etc. legitimately recur in different Inventor components.
+    # Preserve their stored labels without changing the user's saved preference.
+    labels.SetBool('DuplicateLabels',True)
     try:
         if source.suffix.lower()=='.iam':
             if strategy is None:
@@ -200,3 +202,5 @@ def importFile(source, doc=None, root=None, strategy=None):
         if created:
             App.closeDocument(doc.Name)
         raise
+    finally:
+        labels.SetBool('DuplicateLabels',duplicateLabels)

@@ -73,10 +73,11 @@ def ReadElement(ole, fname, counter, geometryOnly=False, featureOnly=False):
 					fnameB.append(n)
 				fnameB[-1] = 'B' + name[1:]
 				seg = ReadRSeMetaDataM(ole.openstream(fname).read(), name[1:])
-				if geometryOnly and not ('brep' in seg.name.lower() or 'graphics' in seg.name.lower() or seg.name == 'AmDcSegment'):
+				if geometryOnly and not ('brep' in seg.name.lower() or 'graphics' in seg.name.lower() or 'browser' in seg.name.lower() or seg.name == 'AmDcSegment'):
 					return
-				if featureOnly and not any(key in seg.name.lower() for key in ('brep', 'dcsegment', 'graphics', 'browser')):
+				if featureOnly and not any(key in seg.name.lower() for key in ('brep', 'dcsegment', 'graphics', 'browser', 'appsegment')):
 					return
+				seg.fontDefinitionsOnly = featureOnly and 'appsegment' in seg.name.lower()
 				seg.file = name[1:]
 				seg.index = counter
 				getModel().RSeMetaData[seg.name] = seg

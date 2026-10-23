@@ -19,7 +19,7 @@ class NativeView:
         obj=self.Object
         if isinstance(obj.Proxy,Boolean):return [obj.Base]+list(obj.Tools)
         if isinstance(obj.Proxy,Coil):return [obj.Profile]
-        if isinstance(obj.Proxy,Profile):return list(obj.Sketches)+list(obj.Sources)
+        if isinstance(obj.Proxy,Profile):return list(obj.Sketches)+list(obj.Sources)+list(getattr(obj,'Texts',[]))
         if isinstance(obj.Proxy,Projection):return [obj.Plane]
         return []
     def getIcon(self):
@@ -40,8 +40,8 @@ class DatumPlane:
 
 class Projection:
     def __init__(self,obj,base,plane):
-        obj.addProperty('App::PropertyLink','Base','Projection').Base=base
-        obj.addProperty('App::PropertyLink','Plane','Projection').Plane=plane
+        obj.addProperty('App::PropertyLinkGlobal','Base','Projection').Base=base
+        obj.addProperty('App::PropertyLinkGlobal','Plane','Projection').Plane=plane
         obj.Proxy=self
         if App.GuiUp:NativeView(obj.ViewObject)
     def execute(self,obj):
@@ -55,20 +55,39 @@ class Projection:
                 if not any(abs(candidate.Length-e.Length)<1e-6 and
                            max((e.distToShape(Part.Vertex(candidate.valueAt(candidate.FirstParameter+(candidate.LastParameter-candidate.FirstParameter)*i/8)))[0] for i in range(9)))<1e-6 for e in edges):
                     edges.append(candidate)
+        # Kernel recomputation may enumerate unchanged projected contours in a
+        # different order. Keep their existing element numbers for live profiles.
+        def key(edge):
+            box=edge.BoundBox
+            return (type(edge.Curve).__name__,)+tuple(round(v,6) for v in
+                    (box.XMin,box.YMin,box.ZMin,box.XMax,box.YMax,box.ZMax,edge.Length))
+        previous=[key(edge) for edge in obj.Shape.Edges]
+        current={key(edge):edge for edge in edges}
+        if len(current)==len(edges) and len(previous)==len(edges) and set(previous)==set(current):
+            edges=[current[value] for value in previous]
+        else:edges.sort(key=key)
         obj.Shape=Part.makeCompound(edges)
 
 
 class Profile:
     """A selected, possibly trimmed sketch region that updates with its sketches."""
-    def __init__(self, obj, sketches, records, sources):
+    def __init__(self, obj, sketches, records, sources, texts=()):
         obj.addProperty('App::PropertyLinkList','Sketches','Profile').Sketches=sketches
         obj.addProperty('App::PropertyLinkList','Sources','Profile').Sources=sources
+        obj.addProperty('App::PropertyLinkList','Texts','Profile').Texts=list(texts)
         obj.addProperty('App::PropertyString','Selection','Profile').Selection=json.dumps(records)
         obj.Proxy=self
         if App.GuiUp:NativeView(obj.ViewObject)
 
     def execute(self, obj):
         edges=[]
+        for text in getattr(obj,'Texts',[]):
+            if text.Shape.isNull() or not text.Shape.isValid():
+                obj.Shape=Part.Shape()
+                raise ValueError('The linked sketch text has no valid contours')
+            # Text edits can change the number of glyphs and holes. Consume its
+            # current complete outline rather than saved EdgeN references.
+            edges.extend(text.Shape.Edges)
         for record in json.loads(obj.Selection):
             sketch=obj.Sketches[record['sketch']]
             if 'source' in record:
@@ -165,8 +184,8 @@ class ThroughAll:
 
 class Boolean:
     def __init__(self,obj,base,tools,operation):
-        obj.addProperty('App::PropertyLink','Base','Boolean').Base=base
-        obj.addProperty('App::PropertyLinkList','Tools','Boolean').Tools=tools
+        obj.addProperty('App::PropertyLinkGlobal','Base','Boolean').Base=base
+        obj.addProperty('App::PropertyLinkListGlobal','Tools','Boolean').Tools=tools
         obj.addProperty('App::PropertyEnumeration','Operation','Boolean').Operation=['Join','Cut','Intersection']
         obj.Operation=operation
         obj.Proxy=self
@@ -187,6 +206,93 @@ class Importer(F.FreeCADImporter):
         self.profiles={}
         self.failures=[]
         self.externalIndices={}
+
+    def getGeometry(self,node):
+        if self.failures:raise ValueError(self.failures[0])
+        result=super().getGeometry(node)
+        if self.failures:raise ValueError(self.failures[0])
+        return result
+
+    @staticmethod
+    def constraintGeometry(geometry):
+        shape=geometry.toShape()
+        if shape.ShapeType=='Vertex':return [shape.Point]
+        return [shape.valueAt(shape.FirstParameter+(shape.LastParameter-shape.FirstParameter)*u) for u in (0,.25,.5,.75,1)]
+
+    def checkedConstraint(self,sketch,before,count,key):
+        status=sketch.solve()
+        drift=max(((a-b).Length for old,new in zip(before,sketch.Geometry)
+                   for a,b in zip(self.constraintGeometry(old),self.constraintGeometry(new))),default=0)
+        if status==0 and drift<=1e-6:return True
+        for index in range(sketch.ConstraintCount-1,count-1,-1):sketch.delConstraint(index)
+        # Restoring the exact source geometry keeps profile intervals valid;
+        # removing a bad constraint alone leaves the solver's displaced curves.
+        sketch.Geometry=before+list(sketch.Geometry[len(before):]);sketch.solve()
+        self.mapConstraints.pop(key,None)
+        if 'InventorConstraintNotes' not in sketch.PropertiesList:
+            sketch.addProperty('App::PropertyStringList','InventorConstraintNotes','Inventor import');sketch.setEditorMode('InventorConstraintNotes',1)
+        sketch.InventorConstraintNotes=list(sketch.InventorConstraintNotes)+[
+            '%s: source constraint not bound (solver %s; displacement %.9g mm)'%(key,status,drift)]
+        return False
+
+    def addConstraint(self,sketch,constraint,key):
+        if getattr(self,'checkingDimension',False):return super().addConstraint(sketch,constraint,key)
+        before=[g.copy() for g in sketch.Geometry];count=sketch.ConstraintCount
+        index=super().addConstraint(sketch,constraint,key)
+        return index if self.checkedConstraint(sketch,before,count,key) else None
+
+    def addDimensionConstraint(self,sketch,dimension,constraint,key,useExpression=True):
+        before=[g.copy() for g in sketch.Geometry];count=sketch.ConstraintCount
+        self.checkingDimension=True
+        try:index=super().addDimensionConstraint(sketch,dimension,constraint,key,useExpression)
+        finally:self.checkingDimension=False
+        return index if self.checkedConstraint(sketch,before,count,key) else None
+
+    def addDistanceConstraint(self,sketch,node,name,prefix):
+        if name not in ('DistanceX','DistanceY'):return super().addDistanceConstraint(sketch,node,name,prefix)
+        if F.skipConstraint(F.BIT_DIM_DISTANCE):return
+        first,second=node.get('entity1'),node.get('entity2')
+        i,p,j,q=self.getIndexPos(sketch,first,second)
+        if i is None or j is None or i==j or (p is not None and q is not None):
+            return super().addDistanceConstraint(sketch,node,name,prefix)
+        # FreeCAD accepts projected point-to-point distances, but its five-
+        # argument point-to-line form exists only for perpendicular Distance.
+        lineIndex=j if q is None else i
+        line=sketch.Geometry[lineIndex]
+        if not isinstance(line,Part.LineSegment):return
+        delta=line.EndPoint-line.StartPoint
+        axis=0 if name=='DistanceX' else 1
+        if abs(delta[axis])>1e-7:
+            F.logWarning('Projected point-to-inclined-line dimension retained in source parameters\n');return
+        p=1 if p is None else p;q=1 if q is None else q
+        a,b=sketch.getPoint(i,p),sketch.getPoint(j,q)
+        dimension=F.getDimension(node,'parameter');value=F.getMM(dimension)
+        signed=math.copysign(abs(value),b[axis]-a[axis])
+        key='Projected%s_%s_%s'%(name,i,j)
+        before=[g.copy() for g in sketch.Geometry];count=sketch.ConstraintCount
+        self.checkingDimension=True
+        try:
+            constraint=Sketcher.Constraint(name,i,p,j,q,signed)
+            index=super().addDimensionConstraint(sketch,dimension,constraint,key,False)
+            alias=dimension.get('alias')
+            if alias:sketch.setExpression('Constraints[%d]'%index,('-' if signed*value<0 else '')+alias)
+        finally:self.checkingDimension=False
+        if self.checkedConstraint(sketch,before,count,key):node.setGeometry(constraint,index)
+
+    def getPointIndexPos(self,sketch,point,entity):
+        if entity.typeName=='Point2D':
+            # Two points can lie on only part of a longer sketch line. Their
+            # dimension must not become the length of that complete line.
+            return self.findEntityPos(sketch,point)+self.findEntityPos(sketch,entity)
+        return super().getPointIndexPos(sketch,point,entity)
+
+    def addSketch_Text2D(self,node,sketch):
+        record=node.get('text')
+        if record is not None and not record.get('lst1'):
+            from importerText import createAnnotation
+            annotation=createAnnotation(App.ActiveDocument,sketch,record)
+            if annotation is not None and self.root:self.root.addObject(annotation)
+        node.setGeometry(None)
 
     def createParameterTable(self, component):
         before={o.Name for o in App.ActiveDocument.Objects}
@@ -228,6 +334,19 @@ class Importer(F.FreeCADImporter):
         DatumPlane(obj)
         obj.Placement=App.Placement(F.p2v(node.get('center')),App.Rotation(x,y,z,'ZXY'))
         obj.Proxy.execute(obj);node.setGeometry(obj);F.hide(obj)
+        if self.root:self.root.addObject(obj)
+
+    def Create_Line3D(self,node):
+        import InventorViewProviders as V
+        obj=V.makeLine(F.p2v(node.get('pos')),F.p2v(node.get('pos')+node.get('dir')),node.name or 'WorkAxis')
+        node.setGeometry(obj);F.hide(obj)
+        if self.root:self.root.addObject(obj)
+
+    def Create_Point3D(self,node):
+        super().Create_Point3D(node)
+        node.geometry.Label=node.name or 'WorkPoint'
+        F.hide(node.geometry)
+        if self.root:self.root.addObject(node.geometry)
 
     @staticmethod
     def attach(obj,base,element,mode,placement):
@@ -299,25 +418,41 @@ class Importer(F.FreeCADImporter):
         if patch.index in self.profiles:return self.profiles[patch.index]
         profile=patch.get('profile')
         if profile is None:raise ValueError('No parametric sketch profile in boundary')
-        sketches=[];records=[];sources=[]
+        sketches=[];records=[];sources=[];texts=[]
         # Text outlines are saved as exact profile curves, separately from the
         # sketch's ordinary entity references. Keep them in an editable sketch.
         outlines=profile.get('lst1') or []
         if not profile.get('parts') and outlines:
             sourceSketch=profile.get('sketch')
             self.getGeometry(sourceSketch)
-            textSketch=F.newObject('Sketcher::SketchObject',sourceSketch.name+'_TextContours')
-            textSketch.Placement=sourceSketch.geometry.Placement
-            for outline in outlines:
-                if outline.typeName!='19F763CB':raise ValueError('Unknown stored text outline format')
-                for curve in outline.get('edges'):
-                    geometry=curve.getGeometry()
-                    geometry.transform(textSketch.Placement.inverse().toMatrix())
-                    index=textSketch.addGeometry(geometry)
-                    records.append(dict(sketch=0,geometry=index,full=True,interval=[0,1]))
-            self.attach(textSketch,sourceSketch.geometry,'','ObjectXY',textSketch.Placement)
-            sketches.append(textSketch)
-            if self.root:self.root.addObject(textSketch)
+            from importerText import createText
+            strings=profile.get('lst2') or []
+            covered=set()
+            for string in strings:
+                selected=[o for o in string.get('lst1') or [] if o.index in {n.index for n in outlines}]
+                if not selected:continue
+                try:
+                    text=createText(App.ActiveDocument,sourceSketch.geometry,string,selected,getModel())
+                except ValueError as exc:
+                    F.logWarning('Sketch text retains saved curves: %s\n',exc)
+                    continue
+                if self.root:self.root.addObject(text)
+                self.attach(text,sourceSketch.geometry,'','ObjectXY',text.Placement)
+                texts.append(text);covered.update(o.index for o in selected)
+            remaining=[o for o in outlines if o.index not in covered]
+            if remaining:
+                textSketch=F.newObject('Sketcher::SketchObject',sourceSketch.name+'_TextContours')
+                textSketch.Placement=sourceSketch.geometry.Placement
+                for outline in remaining:
+                    if outline.typeName!='19F763CB':raise ValueError('Unknown stored text outline format')
+                    for curve in outline.get('edges'):
+                        geometry=curve.getGeometry()
+                        geometry.transform(textSketch.Placement.inverse().toMatrix())
+                        index=textSketch.addGeometry(geometry)
+                        records.append(dict(sketch=0,geometry=index,full=True,interval=[0,1]))
+                self.attach(textSketch,sourceSketch.geometry,'','ObjectXY',textSketch.Placement)
+                sketches.append(textSketch)
+                if self.root:self.root.addObject(textSketch)
 
         for loop in profile.get('parts') or []:
             # Inner loops have operation==0 and must be retained as holes.
@@ -336,7 +471,15 @@ class Importer(F.FreeCADImporter):
                     temporary.addGeometry(entity.geometry.copy())
                 else:
                     super().addGeometryFromNode(temporary,edge)
-                if temporary.GeometryCount!=1:raise ValueError('Profile trimming failed')
+                if temporary.GeometryCount!=1:
+                    p1=edge.get('point1') or F.getAssociatedSketchEntity(sketch,edge.get('point1AI'),edge.get('typPt1'))
+                    p2=edge.get('point2') or F.getAssociatedSketchEntity(sketch,edge.get('point2AI'),edge.get('typPt2'))
+                    if (temporary.GeometryCount==0 and isinstance(entity.geometry,(Part.Line,Part.LineSegment)) and
+                        p1 is not None and p2 is not None and (F.p2v(p1)-F.p2v(p2)).Length<=1e-7):
+                        # A zero-length selection between coincident source
+                        # vertices contributes no profile edge.
+                        App.ActiveDocument.removeObject(temporary.Name);continue
+                    raise ValueError('Profile trimming failed')
                 trimmed=temporary.Geometry[0].toShape()
                 raw=entity.geometry.toShape()
                 full=abs(trimmed.Length-raw.Length)<1e-7 and trimmed.distToShape(raw)[0]<1e-7
@@ -355,11 +498,12 @@ class Importer(F.FreeCADImporter):
                     record.update(source=sources.index(source),element=element)
                 records.append(record)
         obj=F.newObject('Part::FeaturePython',profile.get('sketch').name+'_Profile')
-        Profile(obj,sketches,records,sources)
+        Profile(obj,sketches,records,sources,texts)
         obj.Proxy.execute(obj)
         self.profiles[patch.index]=obj
         if self.root:self.root.addObject(obj)
         for sketch in sketches:F.hide(sketch)
+        for text in texts:F.hide(text)
         return obj
 
     def addSketch_Spline2D(self,node,sketch):
@@ -411,14 +555,9 @@ class Importer(F.FreeCADImporter):
         participants=node.getParticipants()
         if not participants:raise ValueError('Extrusion has no sketch')
         section=participants[0].node
-        if operation==self.FX_EXTRUDE_JOIN:
-            result=self.createFxExtrude_Operation(node,participants[0].node,node.name,'_Add','MultiFuse')
-        elif operation==self.FX_EXTRUDE_CUT:
-            result=self.createFxExtrude_Operation(node,section,node.name,'_Cut','Cut')
-        elif operation==self.FX_EXTRUDE_INTERSECTION:
-            result=self.createFxExtrude_Operation(node,section,node.name,'_Intersection','MultiCommon')
-        elif operation in (self.FX_EXTRUDE_NEW,self.FX_EXTRUDE_SURFACE):
-            result=self.Create_FxExtrude_New(node,section,node.name)
+        if operation in (self.FX_EXTRUDE_JOIN,self.FX_EXTRUDE_CUT,self.FX_EXTRUDE_NEW,self.FX_EXTRUDE_INTERSECTION,self.FX_EXTRUDE_SURFACE):
+            from importerExtrusion import build
+            result=build(self,node,{1:'NewBody',2:'Cut',3:'Join',4:'Intersection',5:'Surface'}[operation])
         else:raise ValueError('Unsupported extrusion operation: '+str(operation))
         if result is None:raise ValueError('Extrusion produced no feature')
         self.featureOperation(result,node,{1:'NewBody',2:'Cut',3:'Join',4:'Intersection',5:'Surface'}[operation])
@@ -443,7 +582,7 @@ class Importer(F.FreeCADImporter):
             if descriptor is None or descriptor.typeName!='151280F0':
                 raise ValueError('Extrusion target plane is not supported')
             profile=self.createBoundary(F.getProperty(p,1))
-            sketch=profile.Sketches[0]
+            sketch=profile.Sketches[0] if profile.Sketches else profile.Texts[0].Sketch
             direction=F.getProperty(p,2).get('dir')
             reverse=F.getPropertyValue(p,3,'value')
             normal=descriptor.get('dir').cross(descriptor.get('point')).normalize()
